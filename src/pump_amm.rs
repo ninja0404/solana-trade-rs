@@ -38,6 +38,19 @@ pub static AMM_FEE_PROGRAM_ID: LazyLock<Pubkey> =
 pub static WSOL_MINT: LazyLock<Pubkey> =
     LazyLock::new(|| Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap());
 
+pub static AMM_BUYBACK_FEE_RECIPIENTS: LazyLock<[Pubkey; 8]> = LazyLock::new(|| {
+    [
+        Pubkey::from_str("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD").unwrap(),
+        Pubkey::from_str("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7").unwrap(),
+        Pubkey::from_str("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL").unwrap(),
+        Pubkey::from_str("3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR").unwrap(),
+        Pubkey::from_str("5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6").unwrap(),
+        Pubkey::from_str("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL").unwrap(),
+        Pubkey::from_str("5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD").unwrap(),
+        Pubkey::from_str("A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW").unwrap(),
+    ]
+});
+
 static ATA_PROGRAM_ID: LazyLock<Pubkey> =
     LazyLock::new(|| Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap());
 
@@ -98,7 +111,11 @@ pub enum AmmError {
 // =====================================================================
 
 pub fn amm_user_volume_accumulator(user: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"user_volume_accumulator", user.as_ref()], &AMM_PROGRAM_ID).0
+    Pubkey::find_program_address(
+        &[b"user_volume_accumulator", user.as_ref()],
+        &AMM_PROGRAM_ID,
+    )
+    .0
 }
 
 /// Derive pool-v2 PDA (required trailing account after PumpSwap upgrade).
@@ -107,11 +124,7 @@ pub fn amm_pool_v2(base_mint: &Pubkey) -> Pubkey {
 }
 
 pub fn amm_coin_creator_vault_authority(coin_creator: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(
-        &[b"creator_vault", coin_creator.as_ref()],
-        &AMM_PROGRAM_ID,
-    )
-    .0
+    Pubkey::find_program_address(&[b"creator_vault", coin_creator.as_ref()], &AMM_PROGRAM_ID).0
 }
 
 // =====================================================================
@@ -129,9 +142,12 @@ pub struct AmmSwapContext {
     pub pool_quote_token_account: Pubkey,
     pub coin_creator: Pubkey,
     pub protocol_fee_recipient: Pubkey,
+    pub buyback_fee_recipient: Pubkey,
     pub base_reserve: u64,
     pub quote_reserve: u64,
     pub is_reversed: bool,
+    pub is_mayhem_mode: bool,
+    pub is_cashback_coin: bool,
 }
 
 /// Pool account data layout offsets (after 8-byte Anchor discriminator).
@@ -140,6 +156,11 @@ const POOL_QUOTE_MINT_OFFSET: usize = 75;
 const POOL_BASE_TOKEN_ACCT_OFFSET: usize = 139;
 const POOL_QUOTE_TOKEN_ACCT_OFFSET: usize = 171;
 const POOL_COIN_CREATOR_OFFSET: usize = 211; // after lp_supply(8)
+const POOL_IS_MAYHEM_MODE_OFFSET: usize = 243;
+const POOL_IS_CASHBACK_COIN_OFFSET: usize = 244;
+const GLOBAL_PROTOCOL_FEE_RECIPIENTS_OFFSET: usize = 57;
+const GLOBAL_RESERVED_FEE_RECIPIENT_OFFSET: usize = 385;
+const GLOBAL_RESERVED_FEE_RECIPIENTS_OFFSET: usize = 418;
 
 fn pubkey_at(data: &[u8], offset: usize) -> Pubkey {
     Pubkey::new_from_array(data[offset..offset + 32].try_into().unwrap())
@@ -150,6 +171,59 @@ fn token_account_balance(data: &[u8]) -> u64 {
         return 0;
     }
     u64::from_le_bytes(data[64..72].try_into().unwrap())
+}
+
+fn random_index(len: usize) -> usize {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as usize
+        % len
+}
+
+fn non_default_pubkeys(data: &[u8], offset: usize, count: usize) -> Vec<Pubkey> {
+    let mut out = Vec::new();
+    for i in 0..count {
+        let off = offset + i * 32;
+        if off + 32 <= data.len() {
+            let pk = pubkey_at(data, off);
+            if pk != Pubkey::default() {
+                out.push(pk);
+            }
+        }
+    }
+    out
+}
+
+fn choose_pubkey(candidates: &[Pubkey], label: &str) -> Result<Pubkey, AmmError> {
+    if candidates.is_empty() {
+        return Err(AmmError::InvalidData(format!("{label} missing")));
+    }
+    Ok(candidates[random_index(candidates.len())])
+}
+
+fn choose_protocol_fee_recipient(
+    global_cfg_data: &[u8],
+    is_mayhem_mode: bool,
+) -> Result<Pubkey, AmmError> {
+    if is_mayhem_mode {
+        let reserved =
+            non_default_pubkeys(global_cfg_data, GLOBAL_RESERVED_FEE_RECIPIENT_OFFSET, 1);
+        if !reserved.is_empty() {
+            return choose_pubkey(&reserved, "reserved fee recipient");
+        }
+        let reserved =
+            non_default_pubkeys(global_cfg_data, GLOBAL_RESERVED_FEE_RECIPIENTS_OFFSET, 7);
+        return choose_pubkey(&reserved, "reserved fee recipients");
+    }
+
+    let normal = non_default_pubkeys(global_cfg_data, GLOBAL_PROTOCOL_FEE_RECIPIENTS_OFFSET, 8);
+    choose_pubkey(&normal, "protocol fee recipients")
+}
+
+fn choose_buyback_fee_recipient() -> Pubkey {
+    AMM_BUYBACK_FEE_RECIPIENTS[random_index(AMM_BUYBACK_FEE_RECIPIENTS.len())]
 }
 
 /// One-shot RPC helper: reads pool account, mints, token vaults, and global
@@ -169,6 +243,16 @@ pub fn read_amm_swap_context(
     let pool_base_token_account = pubkey_at(d, POOL_BASE_TOKEN_ACCT_OFFSET);
     let pool_quote_token_account = pubkey_at(d, POOL_QUOTE_TOKEN_ACCT_OFFSET);
     let coin_creator = pubkey_at(d, POOL_COIN_CREATOR_OFFSET);
+    let is_mayhem_mode = d
+        .get(POOL_IS_MAYHEM_MODE_OFFSET)
+        .copied()
+        .unwrap_or_default()
+        == 1;
+    let is_cashback_coin = d
+        .get(POOL_IS_CASHBACK_COIN_OFFSET)
+        .copied()
+        .unwrap_or_default()
+        == 1;
 
     let base_mint_acct = rpc.get_account(&base_mint)?;
     let quote_mint_acct = rpc.get_account(&quote_mint)?;
@@ -181,33 +265,8 @@ pub fn read_amm_swap_context(
     let quote_reserve = token_account_balance(&quote_vault.data);
 
     let global_cfg = rpc.get_account(&AMM_GLOBAL_CONFIG)?;
-    // GlobalConfigAccount layout (Borsh, after 8-byte discriminator):
-    //   Admin(32) + LpFeeBasisPoints(8) + ProtocolFeeBasisPoints(8) + DisableFlags(1)
-    //   = 8+32+8+8+1 = 57  →  ProtocolFeeRecipients[8] starts at offset 57
-    // Pick a random non-zero recipient from the array (matching SDK behavior)
-    let protocol_fee_recipient = {
-        let mut candidates = Vec::new();
-        for i in 0..8 {
-            let off = 57 + i * 32;
-            if off + 32 <= global_cfg.data.len() {
-                let pk = pubkey_at(&global_cfg.data, off);
-                if pk != Pubkey::default() {
-                    candidates.push(pk);
-                }
-            }
-        }
-        if candidates.is_empty() {
-            Pubkey::default()
-        } else {
-            use std::time::SystemTime;
-            let idx = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as usize
-                % candidates.len();
-            candidates[idx]
-        }
-    };
+    let protocol_fee_recipient = choose_protocol_fee_recipient(&global_cfg.data, is_mayhem_mode)?;
+    let buyback_fee_recipient = choose_buyback_fee_recipient();
 
     let is_reversed = base_mint == *WSOL_MINT;
 
@@ -221,9 +280,12 @@ pub fn read_amm_swap_context(
         pool_quote_token_account,
         coin_creator,
         protocol_fee_recipient,
+        buyback_fee_recipient,
         base_reserve,
         quote_reserve,
         is_reversed,
+        is_mayhem_mode,
+        is_cashback_coin,
     })
 }
 
@@ -237,10 +299,7 @@ fn system_transfer_ix(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction 
     Instruction::new_with_bytes(
         system_program::id(),
         &data,
-        vec![
-            AccountMeta::new(*from, true),
-            AccountMeta::new(*to, false),
-        ],
+        vec![AccountMeta::new(*from, true), AccountMeta::new(*to, false)],
     )
 }
 
@@ -304,6 +363,35 @@ fn compute_unit_price_ix(micro_lamports: u64) -> Instruction {
     Instruction::new_with_bytes(*COMPUTE_BUDGET_ID, &data, vec![])
 }
 
+fn append_v2_remaining_accounts(
+    accounts: &mut Vec<AccountMeta>,
+    ctx: &AmmSwapContext,
+    user: &Pubkey,
+    include_cashback_user_volume_pda: bool,
+) {
+    if ctx.is_cashback_coin {
+        let user_vol = amm_user_volume_accumulator(user);
+        let accumulator_wsol_ata = derive_ata(&user_vol, &WSOL_MINT, &TOKEN_PROGRAM_ID);
+        accounts.push(AccountMeta::new(accumulator_wsol_ata, false));
+        if include_cashback_user_volume_pda {
+            accounts.push(AccountMeta::new(user_vol, false));
+        }
+    }
+
+    accounts.push(AccountMeta::new_readonly(
+        amm_pool_v2(&ctx.base_mint),
+        false,
+    ));
+
+    let buyback_fee_ata = derive_ata(
+        &ctx.buyback_fee_recipient,
+        &ctx.quote_mint,
+        &ctx.quote_token_program,
+    );
+    accounts.push(AccountMeta::new_readonly(ctx.buyback_fee_recipient, false));
+    accounts.push(AccountMeta::new(buyback_fee_ata, false));
+}
+
 // =====================================================================
 // PumpAMM swap instructions
 // =====================================================================
@@ -332,41 +420,40 @@ fn amm_buy_ix(
     );
     let user_vol = amm_user_volume_accumulator(user);
 
-    let mut data = Vec::with_capacity(24);
+    let mut data = Vec::with_capacity(25);
     data.extend_from_slice(&AMM_BUY_DISC);
     data.extend_from_slice(&base_amount_out.to_le_bytes());
     data.extend_from_slice(&max_quote_in.to_le_bytes());
+    data.push(0u8);
 
-    Instruction::new_with_bytes(
-        *AMM_PROGRAM_ID,
-        &data,
-        vec![
-            AccountMeta::new(ctx.pool, false),                                  //  0
-            AccountMeta::new(*user, true),                                      //  1
-            AccountMeta::new_readonly(*AMM_GLOBAL_CONFIG, false),               //  2
-            AccountMeta::new_readonly(ctx.base_mint, false),                    //  3
-            AccountMeta::new_readonly(ctx.quote_mint, false),                   //  4
-            AccountMeta::new(user_base_ata, false),                            //  5
-            AccountMeta::new(user_quote_ata, false),                           //  6
-            AccountMeta::new(ctx.pool_base_token_account, false),              //  7
-            AccountMeta::new(ctx.pool_quote_token_account, false),             //  8
-            AccountMeta::new_readonly(ctx.protocol_fee_recipient, false),       //  9
-            AccountMeta::new(protocol_fee_ata, false),                         // 10
-            AccountMeta::new_readonly(ctx.base_token_program, false),          // 11
-            AccountMeta::new_readonly(ctx.quote_token_program, false),         // 12
-            AccountMeta::new_readonly(system_program::id(), false),            // 13
-            AccountMeta::new_readonly(*ATA_PROGRAM_ID, false),                 // 14
-            AccountMeta::new_readonly(*AMM_EVENT_AUTHORITY, false),            // 15
-            AccountMeta::new_readonly(*AMM_PROGRAM_ID, false),                 // 16
-            AccountMeta::new(creator_vault_ata, false),                        // 17
-            AccountMeta::new_readonly(creator_vault_auth, false),              // 18
-            AccountMeta::new_readonly(*AMM_GLOBAL_VOLUME_ACCUM, false),        // 19
-            AccountMeta::new(user_vol, false),                                 // 20
-            AccountMeta::new_readonly(*AMM_FEE_CONFIG, false),                 // 21
-            AccountMeta::new_readonly(*AMM_FEE_PROGRAM_ID, false),             // 22
-            AccountMeta::new_readonly(amm_pool_v2(&ctx.base_mint), false),     // 23 pool-v2
-        ],
-    )
+    let mut accounts = vec![
+        AccountMeta::new(ctx.pool, false),
+        AccountMeta::new(*user, true),
+        AccountMeta::new_readonly(*AMM_GLOBAL_CONFIG, false),
+        AccountMeta::new_readonly(ctx.base_mint, false),
+        AccountMeta::new_readonly(ctx.quote_mint, false),
+        AccountMeta::new(user_base_ata, false),
+        AccountMeta::new(user_quote_ata, false),
+        AccountMeta::new(ctx.pool_base_token_account, false),
+        AccountMeta::new(ctx.pool_quote_token_account, false),
+        AccountMeta::new_readonly(ctx.protocol_fee_recipient, false),
+        AccountMeta::new(protocol_fee_ata, false),
+        AccountMeta::new_readonly(ctx.base_token_program, false),
+        AccountMeta::new_readonly(ctx.quote_token_program, false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(*ATA_PROGRAM_ID, false),
+        AccountMeta::new_readonly(*AMM_EVENT_AUTHORITY, false),
+        AccountMeta::new_readonly(*AMM_PROGRAM_ID, false),
+        AccountMeta::new(creator_vault_ata, false),
+        AccountMeta::new_readonly(creator_vault_auth, false),
+        AccountMeta::new_readonly(*AMM_GLOBAL_VOLUME_ACCUM, false),
+        AccountMeta::new(user_vol, false),
+        AccountMeta::new_readonly(*AMM_FEE_CONFIG, false),
+        AccountMeta::new_readonly(*AMM_FEE_PROGRAM_ID, false),
+    ];
+    append_v2_remaining_accounts(&mut accounts, ctx, user, false);
+
+    Instruction::new_with_bytes(*AMM_PROGRAM_ID, &data, accounts)
 }
 
 /// BuyExactQuoteIn — spend exact SOL (quote), receive >= min tokens (base).
@@ -391,45 +478,41 @@ fn amm_buy_exact_quote_in_ix(
         &ctx.quote_token_program,
     );
     let user_vol = amm_user_volume_accumulator(user);
-    let user_vol_wsol_ata = derive_ata(&user_vol, &ctx.quote_mint, &ctx.quote_token_program);
 
-    let mut data = Vec::with_capacity(24);
+    let mut data = Vec::with_capacity(25);
     data.extend_from_slice(&AMM_BUY_EXACT_QUOTE_IN_DISC);
     data.extend_from_slice(&spendable_quote_in.to_le_bytes());
     data.extend_from_slice(&min_base_amount_out.to_le_bytes());
-    // NO trackVolume byte — omit it, matching successful on-chain transactions
+    data.push(0u8);
 
-    Instruction::new_with_bytes(
-        *AMM_PROGRAM_ID,
-        &data,
-        vec![
-            AccountMeta::new(ctx.pool, false),                                  //  0
-            AccountMeta::new(*user, true),                                      //  1
-            AccountMeta::new_readonly(*AMM_GLOBAL_CONFIG, false),               //  2
-            AccountMeta::new_readonly(ctx.base_mint, false),                    //  3
-            AccountMeta::new_readonly(ctx.quote_mint, false),                   //  4
-            AccountMeta::new(user_base_ata, false),                            //  5
-            AccountMeta::new(user_quote_ata, false),                           //  6
-            AccountMeta::new(ctx.pool_base_token_account, false),              //  7
-            AccountMeta::new(ctx.pool_quote_token_account, false),             //  8
-            AccountMeta::new_readonly(ctx.protocol_fee_recipient, false),       //  9
-            AccountMeta::new(protocol_fee_ata, false),                         // 10
-            AccountMeta::new_readonly(ctx.base_token_program, false),          // 11
-            AccountMeta::new_readonly(ctx.quote_token_program, false),         // 12
-            AccountMeta::new_readonly(system_program::id(), false),            // 13
-            AccountMeta::new_readonly(*ATA_PROGRAM_ID, false),                 // 14
-            AccountMeta::new_readonly(*AMM_EVENT_AUTHORITY, false),            // 15
-            AccountMeta::new_readonly(*AMM_PROGRAM_ID, false),                 // 16
-            AccountMeta::new(creator_vault_ata, false),                        // 17
-            AccountMeta::new_readonly(creator_vault_auth, false),              // 18
-            AccountMeta::new_readonly(*AMM_GLOBAL_VOLUME_ACCUM, false),        // 19
-            AccountMeta::new(user_vol, false),                                 // 20
-            AccountMeta::new_readonly(*AMM_FEE_CONFIG, false),                 // 21
-            AccountMeta::new_readonly(*AMM_FEE_PROGRAM_ID, false),             // 22
-            AccountMeta::new(user_vol_wsol_ata, false),                        // 23 cashback
-            AccountMeta::new_readonly(amm_pool_v2(&ctx.base_mint), false),     // 24 pool-v2
-        ],
-    )
+    let mut accounts = vec![
+        AccountMeta::new(ctx.pool, false),
+        AccountMeta::new(*user, true),
+        AccountMeta::new_readonly(*AMM_GLOBAL_CONFIG, false),
+        AccountMeta::new_readonly(ctx.base_mint, false),
+        AccountMeta::new_readonly(ctx.quote_mint, false),
+        AccountMeta::new(user_base_ata, false),
+        AccountMeta::new(user_quote_ata, false),
+        AccountMeta::new(ctx.pool_base_token_account, false),
+        AccountMeta::new(ctx.pool_quote_token_account, false),
+        AccountMeta::new_readonly(ctx.protocol_fee_recipient, false),
+        AccountMeta::new(protocol_fee_ata, false),
+        AccountMeta::new_readonly(ctx.base_token_program, false),
+        AccountMeta::new_readonly(ctx.quote_token_program, false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(*ATA_PROGRAM_ID, false),
+        AccountMeta::new_readonly(*AMM_EVENT_AUTHORITY, false),
+        AccountMeta::new_readonly(*AMM_PROGRAM_ID, false),
+        AccountMeta::new(creator_vault_ata, false),
+        AccountMeta::new_readonly(creator_vault_auth, false),
+        AccountMeta::new_readonly(*AMM_GLOBAL_VOLUME_ACCUM, false),
+        AccountMeta::new(user_vol, false),
+        AccountMeta::new_readonly(*AMM_FEE_CONFIG, false),
+        AccountMeta::new_readonly(*AMM_FEE_PROGRAM_ID, false),
+    ];
+    append_v2_remaining_accounts(&mut accounts, ctx, user, false);
+
+    Instruction::new_with_bytes(*AMM_PROGRAM_ID, &data, accounts)
 }
 
 /// Sell — sell exact tokens (base), receive >= min SOL (quote).
@@ -459,34 +542,32 @@ fn amm_sell_ix(
     data.extend_from_slice(&base_amount_in.to_le_bytes());
     data.extend_from_slice(&min_quote_amount_out.to_le_bytes());
 
-    Instruction::new_with_bytes(
-        *AMM_PROGRAM_ID,
-        &data,
-        vec![
-            AccountMeta::new(ctx.pool, false),                                  //  0
-            AccountMeta::new(*user, true),                                      //  1
-            AccountMeta::new_readonly(*AMM_GLOBAL_CONFIG, false),               //  2
-            AccountMeta::new_readonly(ctx.base_mint, false),                    //  3
-            AccountMeta::new_readonly(ctx.quote_mint, false),                   //  4
-            AccountMeta::new(user_base_ata, false),                            //  5
-            AccountMeta::new(user_quote_ata, false),                           //  6
-            AccountMeta::new(ctx.pool_base_token_account, false),              //  7
-            AccountMeta::new(ctx.pool_quote_token_account, false),             //  8
-            AccountMeta::new_readonly(ctx.protocol_fee_recipient, false),       //  9
-            AccountMeta::new(protocol_fee_ata, false),                         // 10
-            AccountMeta::new_readonly(ctx.base_token_program, false),          // 11
-            AccountMeta::new_readonly(ctx.quote_token_program, false),         // 12
-            AccountMeta::new_readonly(system_program::id(), false),            // 13
-            AccountMeta::new_readonly(*ATA_PROGRAM_ID, false),                 // 14
-            AccountMeta::new_readonly(*AMM_EVENT_AUTHORITY, false),            // 15
-            AccountMeta::new_readonly(*AMM_PROGRAM_ID, false),                 // 16
-            AccountMeta::new(creator_vault_ata, false),                        // 17
-            AccountMeta::new_readonly(creator_vault_auth, false),              // 18
-            AccountMeta::new_readonly(*AMM_FEE_CONFIG, false),                 // 19
-            AccountMeta::new_readonly(*AMM_FEE_PROGRAM_ID, false),             // 20
-            AccountMeta::new_readonly(amm_pool_v2(&ctx.base_mint), false),     // 21 pool-v2
-        ],
-    )
+    let mut accounts = vec![
+        AccountMeta::new(ctx.pool, false),
+        AccountMeta::new(*user, true),
+        AccountMeta::new_readonly(*AMM_GLOBAL_CONFIG, false),
+        AccountMeta::new_readonly(ctx.base_mint, false),
+        AccountMeta::new_readonly(ctx.quote_mint, false),
+        AccountMeta::new(user_base_ata, false),
+        AccountMeta::new(user_quote_ata, false),
+        AccountMeta::new(ctx.pool_base_token_account, false),
+        AccountMeta::new(ctx.pool_quote_token_account, false),
+        AccountMeta::new_readonly(ctx.protocol_fee_recipient, false),
+        AccountMeta::new(protocol_fee_ata, false),
+        AccountMeta::new_readonly(ctx.base_token_program, false),
+        AccountMeta::new_readonly(ctx.quote_token_program, false),
+        AccountMeta::new_readonly(system_program::id(), false),
+        AccountMeta::new_readonly(*ATA_PROGRAM_ID, false),
+        AccountMeta::new_readonly(*AMM_EVENT_AUTHORITY, false),
+        AccountMeta::new_readonly(*AMM_PROGRAM_ID, false),
+        AccountMeta::new(creator_vault_ata, false),
+        AccountMeta::new_readonly(creator_vault_auth, false),
+        AccountMeta::new_readonly(*AMM_FEE_CONFIG, false),
+        AccountMeta::new_readonly(*AMM_FEE_PROGRAM_ID, false),
+    ];
+    append_v2_remaining_accounts(&mut accounts, ctx, user, true);
+
+    Instruction::new_with_bytes(*AMM_PROGRAM_ID, &data, accounts)
 }
 
 // =====================================================================
@@ -516,11 +597,7 @@ pub struct AmmSellParams {
 
 /// Build a buy transaction for a **normal** pool (BaseMint=Token, QuoteMint=WSOL).
 /// PumpAMM handles SOL→WSOL wrapping internally — no manual wrap/sync needed.
-fn build_normal_buy(
-    signer: &Keypair,
-    ctx: &AmmSwapContext,
-    params: &AmmBuyParams,
-) -> Transaction {
+fn build_normal_buy(signer: &Keypair, ctx: &AmmSwapContext, params: &AmmBuyParams) -> Transaction {
     let user = signer.pubkey();
     let cu = params.compute_unit_limit.unwrap_or(300_000);
 
@@ -530,12 +607,36 @@ fn build_normal_buy(
         ixs.push(compute_unit_price_ix(p));
     }
     let user_quote_ata = derive_ata(&user, &ctx.quote_mint, &ctx.quote_token_program);
-    ixs.push(create_ata_idempotent_ix(&user, &user, &ctx.base_mint, &ctx.base_token_program));
-    ixs.push(create_ata_idempotent_ix(&user, &user, &ctx.quote_mint, &ctx.quote_token_program));
-    ixs.push(system_transfer_ix(&user, &user_quote_ata, params.sol_amount_lamports));
+    ixs.push(create_ata_idempotent_ix(
+        &user,
+        &user,
+        &ctx.base_mint,
+        &ctx.base_token_program,
+    ));
+    ixs.push(create_ata_idempotent_ix(
+        &user,
+        &user,
+        &ctx.quote_mint,
+        &ctx.quote_token_program,
+    ));
+    ixs.push(system_transfer_ix(
+        &user,
+        &user_quote_ata,
+        params.sol_amount_lamports,
+    ));
     ixs.push(sync_native_ix(&user_quote_ata, &ctx.quote_token_program));
-    ixs.push(amm_buy_exact_quote_in_ix(params.sol_amount_lamports, 1, ctx, &user));
-    ixs.push(close_account_ix(&user_quote_ata, &user, &user, &ctx.quote_token_program));
+    ixs.push(amm_buy_exact_quote_in_ix(
+        params.sol_amount_lamports,
+        1,
+        ctx,
+        &user,
+    ));
+    ixs.push(close_account_ix(
+        &user_quote_ata,
+        &user,
+        &user,
+        &ctx.quote_token_program,
+    ));
 
     Transaction::new_signed_with_payer(&ixs, Some(&user), &[signer], params.recent_blockhash)
 }
@@ -551,20 +652,27 @@ fn build_reversed_buy(
     // On-chain: base=WSOL, quote=Token → swap back for Sell instruction
     let on_chain_ctx = AmmSwapContext {
         pool: ctx.pool,
-        base_mint: ctx.quote_mint,   // WSOL
-        quote_mint: ctx.base_mint,   // Token
+        base_mint: ctx.quote_mint, // WSOL
+        quote_mint: ctx.base_mint, // Token
         base_token_program: ctx.quote_token_program,
         quote_token_program: ctx.base_token_program,
         pool_base_token_account: ctx.pool_quote_token_account,
         pool_quote_token_account: ctx.pool_base_token_account,
         coin_creator: ctx.coin_creator,
         protocol_fee_recipient: ctx.protocol_fee_recipient,
+        buyback_fee_recipient: ctx.buyback_fee_recipient,
         base_reserve: ctx.quote_reserve,
         quote_reserve: ctx.base_reserve,
         is_reversed: false,
+        is_mayhem_mode: ctx.is_mayhem_mode,
+        is_cashback_coin: ctx.is_cashback_coin,
     };
 
-    let user_wsol_ata = derive_ata(&user, &on_chain_ctx.base_mint, &on_chain_ctx.base_token_program);
+    let user_wsol_ata = derive_ata(
+        &user,
+        &on_chain_ctx.base_mint,
+        &on_chain_ctx.base_token_program,
+    );
     let cu = params.compute_unit_limit.unwrap_or(300_000);
 
     let mut ixs = Vec::with_capacity(8);
@@ -572,13 +680,28 @@ fn build_reversed_buy(
     if let Some(p) = params.compute_unit_price_micro_lamports {
         ixs.push(compute_unit_price_ix(p));
     }
-    ixs.push(create_ata_idempotent_ix(&user, &user, &on_chain_ctx.quote_mint, &on_chain_ctx.quote_token_program));
-    ixs.push(create_ata_idempotent_ix(&user, &user, &on_chain_ctx.base_mint, &on_chain_ctx.base_token_program));
-    let max_quote_in = params.sol_amount_lamports
+    ixs.push(create_ata_idempotent_ix(
+        &user,
+        &user,
+        &on_chain_ctx.quote_mint,
+        &on_chain_ctx.quote_token_program,
+    ));
+    ixs.push(create_ata_idempotent_ix(
+        &user,
+        &user,
+        &on_chain_ctx.base_mint,
+        &on_chain_ctx.base_token_program,
+    ));
+    let max_quote_in = params
+        .sol_amount_lamports
         .checked_mul(10_000 + params.slippage_bps)
-        .unwrap_or(params.sol_amount_lamports) / 10_000;
+        .unwrap_or(params.sol_amount_lamports)
+        / 10_000;
     ixs.push(system_transfer_ix(&user, &user_wsol_ata, max_quote_in));
-    ixs.push(sync_native_ix(&user_wsol_ata, &on_chain_ctx.base_token_program));
+    ixs.push(sync_native_ix(
+        &user_wsol_ata,
+        &on_chain_ctx.base_token_program,
+    ));
     // Sell WSOL to get Token (min_tokens_out = 1 for simplicity in reversed)
     ixs.push(amm_sell_ix(
         params.sol_amount_lamports,
@@ -586,7 +709,12 @@ fn build_reversed_buy(
         &on_chain_ctx,
         &user,
     ));
-    ixs.push(close_account_ix(&user_wsol_ata, &user, &user, &on_chain_ctx.base_token_program));
+    ixs.push(close_account_ix(
+        &user_wsol_ata,
+        &user,
+        &user,
+        &on_chain_ctx.base_token_program,
+    ));
 
     Transaction::new_signed_with_payer(&ixs, Some(&user), &[signer], params.recent_blockhash)
 }
@@ -606,9 +734,24 @@ fn build_normal_sell(
     if let Some(p) = params.compute_unit_price_micro_lamports {
         ixs.push(compute_unit_price_ix(p));
     }
-    ixs.push(create_ata_idempotent_ix(&user, &user, &ctx.quote_mint, &ctx.quote_token_program));
-    ixs.push(amm_sell_ix(params.token_amount, params.min_sol_out, ctx, &user));
-    ixs.push(close_account_ix(&user_quote_ata, &user, &user, &ctx.quote_token_program));
+    ixs.push(create_ata_idempotent_ix(
+        &user,
+        &user,
+        &ctx.quote_mint,
+        &ctx.quote_token_program,
+    ));
+    ixs.push(amm_sell_ix(
+        params.token_amount,
+        params.min_sol_out,
+        ctx,
+        &user,
+    ));
+    ixs.push(close_account_ix(
+        &user_quote_ata,
+        &user,
+        &user,
+        &ctx.quote_token_program,
+    ));
 
     Transaction::new_signed_with_payer(&ixs, Some(&user), &[signer], params.recent_blockhash)
 }
@@ -631,12 +774,19 @@ fn build_reversed_sell(
         pool_quote_token_account: ctx.pool_base_token_account,
         coin_creator: ctx.coin_creator,
         protocol_fee_recipient: ctx.protocol_fee_recipient,
+        buyback_fee_recipient: ctx.buyback_fee_recipient,
         base_reserve: ctx.quote_reserve,
         quote_reserve: ctx.base_reserve,
         is_reversed: false,
+        is_mayhem_mode: ctx.is_mayhem_mode,
+        is_cashback_coin: ctx.is_cashback_coin,
     };
 
-    let user_wsol_ata = derive_ata(&user, &on_chain_ctx.base_mint, &on_chain_ctx.base_token_program);
+    let user_wsol_ata = derive_ata(
+        &user,
+        &on_chain_ctx.base_mint,
+        &on_chain_ctx.base_token_program,
+    );
     let cu = params.compute_unit_limit.unwrap_or(300_000);
 
     let mut ixs = Vec::with_capacity(5);
@@ -644,7 +794,12 @@ fn build_reversed_sell(
     if let Some(p) = params.compute_unit_price_micro_lamports {
         ixs.push(compute_unit_price_ix(p));
     }
-    ixs.push(create_ata_idempotent_ix(&user, &user, &on_chain_ctx.base_mint, &on_chain_ctx.base_token_program));
+    ixs.push(create_ata_idempotent_ix(
+        &user,
+        &user,
+        &on_chain_ctx.base_mint,
+        &on_chain_ctx.base_token_program,
+    ));
     // Buy WSOL (base) with Token (quote): calculate WSOL amount from token input
     let total_fee_bps = 100u128;
     let effective = (params.token_amount as u128) * 10_000 / (10_000 + total_fee_bps);
@@ -654,8 +809,18 @@ fn build_reversed_sell(
     } else {
         params.min_sol_out
     };
-    ixs.push(amm_buy_ix(wsol_out, params.token_amount, &on_chain_ctx, &user));
-    ixs.push(close_account_ix(&user_wsol_ata, &user, &user, &on_chain_ctx.base_token_program));
+    ixs.push(amm_buy_ix(
+        wsol_out,
+        params.token_amount,
+        &on_chain_ctx,
+        &user,
+    ));
+    ixs.push(close_account_ix(
+        &user_wsol_ata,
+        &user,
+        &user,
+        &on_chain_ctx.base_token_program,
+    ));
 
     Transaction::new_signed_with_payer(&ixs, Some(&user), &[signer], params.recent_blockhash)
 }
@@ -747,4 +912,68 @@ pub fn amm_quote_sell(ctx: &AmmSwapContext, token_amount_in: u64, total_fee_bps:
         return 0;
     }
     ((ctx.quote_reserve as u128) * amount_after_fee / denom) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_context(is_cashback_coin: bool) -> AmmSwapContext {
+        AmmSwapContext {
+            pool: Pubkey::new_unique(),
+            base_mint: Pubkey::new_unique(),
+            quote_mint: *WSOL_MINT,
+            base_token_program: *TOKEN_2022_ID,
+            quote_token_program: *TOKEN_PROGRAM_ID,
+            pool_base_token_account: Pubkey::new_unique(),
+            pool_quote_token_account: Pubkey::new_unique(),
+            coin_creator: Pubkey::new_unique(),
+            protocol_fee_recipient: Pubkey::new_unique(),
+            buyback_fee_recipient: AMM_BUYBACK_FEE_RECIPIENTS[0],
+            base_reserve: 1_000_000,
+            quote_reserve: 1_000_000,
+            is_reversed: false,
+            is_mayhem_mode: false,
+            is_cashback_coin,
+        }
+    }
+
+    #[test]
+    fn protocol_fee_recipient_uses_pool_mayhem_flag() {
+        let normal = Pubkey::new_unique();
+        let reserved = Pubkey::new_unique();
+        let mut data = vec![0u8; GLOBAL_RESERVED_FEE_RECIPIENTS_OFFSET + 7 * 32];
+        data[GLOBAL_PROTOCOL_FEE_RECIPIENTS_OFFSET..GLOBAL_PROTOCOL_FEE_RECIPIENTS_OFFSET + 32]
+            .copy_from_slice(normal.as_ref());
+        data[GLOBAL_RESERVED_FEE_RECIPIENT_OFFSET..GLOBAL_RESERVED_FEE_RECIPIENT_OFFSET + 32]
+            .copy_from_slice(reserved.as_ref());
+
+        assert_eq!(choose_protocol_fee_recipient(&data, false).unwrap(), normal);
+        assert_eq!(
+            choose_protocol_fee_recipient(&data, true).unwrap(),
+            reserved
+        );
+    }
+
+    #[test]
+    fn buy_exact_quote_in_uses_v2_remaining_accounts() {
+        let user = Pubkey::new_unique();
+        let ix = amm_buy_exact_quote_in_ix(1_000, 1, &test_context(false), &user);
+        assert_eq!(ix.data.len(), 25);
+        assert_eq!(ix.accounts.len(), 26);
+
+        let ix = amm_buy_exact_quote_in_ix(1_000, 1, &test_context(true), &user);
+        assert_eq!(ix.data.len(), 25);
+        assert_eq!(ix.accounts.len(), 27);
+    }
+
+    #[test]
+    fn sell_uses_cashback_accounts_before_v2_tail() {
+        let user = Pubkey::new_unique();
+        let ix = amm_sell_ix(1_000, 1, &test_context(false), &user);
+        assert_eq!(ix.accounts.len(), 24);
+
+        let ix = amm_sell_ix(1_000, 1, &test_context(true), &user);
+        assert_eq!(ix.accounts.len(), 26);
+    }
 }

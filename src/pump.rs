@@ -34,6 +34,22 @@ pub static FEE_PROGRAM_ID: LazyLock<Pubkey> =
 pub static FEE_RECIPIENT: LazyLock<Pubkey> =
     LazyLock::new(|| Pubkey::from_str("7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ").unwrap());
 
+pub static WSOL_MINT: LazyLock<Pubkey> =
+    LazyLock::new(|| Pubkey::from_str("So11111111111111111111111111111111111111112").unwrap());
+
+pub static BUYBACK_FEE_RECIPIENTS: LazyLock<[Pubkey; 8]> = LazyLock::new(|| {
+    [
+        Pubkey::from_str("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD").unwrap(),
+        Pubkey::from_str("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7").unwrap(),
+        Pubkey::from_str("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL").unwrap(),
+        Pubkey::from_str("3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR").unwrap(),
+        Pubkey::from_str("5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6").unwrap(),
+        Pubkey::from_str("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL").unwrap(),
+        Pubkey::from_str("5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD").unwrap(),
+        Pubkey::from_str("A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW").unwrap(),
+    ]
+});
+
 static ATA_PROGRAM_ID: LazyLock<Pubkey> =
     LazyLock::new(|| Pubkey::from_str("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL").unwrap());
 
@@ -71,6 +87,9 @@ pub static FEE_CONFIG_PDA: LazyLock<Pubkey> = LazyLock::new(|| {
 const BUY_DISC: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const BUY_EXACT_SOL_IN_DISC: [u8; 8] = [56, 252, 116, 8, 158, 223, 205, 95];
 const SELL_DISC: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+const BUY_V2_DISC: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
+const BUY_EXACT_QUOTE_IN_V2_DISC: [u8; 8] = [194, 171, 28, 70, 104, 77, 91, 47];
+const SELL_V2_DISC: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
 
 // =====================================================================
 // Error
@@ -119,9 +138,64 @@ pub fn derive_bonding_curve_v2(mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &PUMP_PROGRAM_ID).0
 }
 
+pub fn derive_sharing_config(mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"sharing-config", mint.as_ref()], &FEE_PROGRAM_ID).0
+}
+
 // =====================================================================
 // Global Account Reader
 // =====================================================================
+
+pub struct BondingCurveInfo {
+    pub creator: Pubkey,
+    pub is_mayhem_mode: bool,
+    pub is_cashback_coin: bool,
+    pub quote_mint: Pubkey,
+}
+
+impl BondingCurveInfo {
+    pub fn quote_mint_or_wsol(&self) -> Pubkey {
+        if self.quote_mint == Pubkey::default() {
+            *WSOL_MINT
+        } else {
+            self.quote_mint
+        }
+    }
+}
+
+pub fn read_bonding_curve_info(
+    rpc_client: &RpcClient,
+    mint: &Pubkey,
+) -> Result<BondingCurveInfo, PumpError> {
+    let bonding_curve = derive_bonding_curve(mint);
+    let account = rpc_client.get_account(&bonding_curve)?;
+    let data = &account.data;
+    if data.len() < 81 {
+        return Err(PumpError::InvalidParam(
+            "BondingCurve account data too short".into(),
+        ));
+    }
+
+    let creator_bytes: [u8; 32] = data[49..81]
+        .try_into()
+        .map_err(|_| PumpError::InvalidParam("bad creator slice".into()))?;
+    let quote_mint = if data.len() >= 115 {
+        Pubkey::new_from_array(
+            data[83..115]
+                .try_into()
+                .map_err(|_| PumpError::InvalidParam("bad quote_mint slice".into()))?,
+        )
+    } else {
+        Pubkey::default()
+    };
+
+    Ok(BondingCurveInfo {
+        creator: Pubkey::new_from_array(creator_bytes),
+        is_mayhem_mode: data.get(81).copied().unwrap_or_default() == 1,
+        is_cashback_coin: data.get(82).copied().unwrap_or_default() == 1,
+        quote_mint,
+    })
+}
 
 /// Check whether the bonding-curve-v2 PDA exists on-chain for a given mint.
 /// Tokens created after the Cashback upgrade have it; older tokens do not.
@@ -138,7 +212,9 @@ pub fn read_fee_recipient(rpc_client: &RpcClient) -> Result<Pubkey, PumpError> {
     // Global account layout (Anchor): discriminator(8) + initialized(1) + authority(32)
     // + fee_recipient(32) starts at offset 41
     if data.len() < 73 {
-        return Err(PumpError::InvalidParam("Global account data too short".into()));
+        return Err(PumpError::InvalidParam(
+            "Global account data too short".into(),
+        ));
     }
     let bytes: [u8; 32] = data[41..73]
         .try_into()
@@ -197,7 +273,7 @@ fn create_ata_idempotent_ix(
     )
 }
 
-/// Buy instruction – 17 accounts (same layout as BuyExactSolIn).
+/// Buy instruction – 16 accounts (same layout as BuyExactSolIn).
 /// Uses token amount + max SOL cost instead of exact SOL input.
 fn buy_ix(
     amount: u64,
@@ -239,12 +315,11 @@ fn buy_ix(
             AccountMeta::new(user_vol_accum, false),
             AccountMeta::new_readonly(*FEE_CONFIG_PDA, false),
             AccountMeta::new_readonly(*FEE_PROGRAM_ID, false),
-            AccountMeta::new(derive_bonding_curve_v2(mint), false),
         ],
     )
 }
 
-/// BuyExactSolIn instruction – 17 accounts.
+/// BuyExactSolIn instruction – 16 accounts.
 ///
 ///  0  global                    (R)
 ///  1  fee_recipient             (W)
@@ -262,7 +337,6 @@ fn buy_ix(
 /// 13  user_volume_accumulator   (W)
 /// 14  fee_config                (R)
 /// 15  fee_program               (R)
-/// 16  bonding_curve_v2          (R)  ← Cashback upgrade
 fn buy_exact_sol_in_ix(
     spendable_sol_in: u64,
     min_tokens_out: u64,
@@ -277,7 +351,6 @@ fn buy_exact_sol_in_ix(
     let assoc_bonding_curve = derive_ata(&bonding_curve, mint, token_program);
     let assoc_user = derive_ata(user, mint, token_program);
     let user_vol_accum = derive_user_volume_accumulator(user);
-    let bonding_curve_v2 = derive_bonding_curve_v2(mint);
 
     let mut data = Vec::with_capacity(25);
     data.extend_from_slice(&BUY_EXACT_SOL_IN_DISC);
@@ -305,14 +378,13 @@ fn buy_exact_sol_in_ix(
             AccountMeta::new(user_vol_accum, false),
             AccountMeta::new_readonly(*FEE_CONFIG_PDA, false),
             AccountMeta::new_readonly(*FEE_PROGRAM_ID, false),
-            AccountMeta::new(bonding_curve_v2, false),
         ],
     )
 }
 
 /// Sell instruction – account count depends on cashback flag:
-///   Non-cashback: 15 accounts (14 base + bonding_curve_v2)
-///   Cashback:     16 accounts (14 base + user_volume_accumulator + bonding_curve_v2)
+///   Non-cashback: 14 accounts
+///   Cashback:     15 accounts (adds user_volume_accumulator)
 fn sell_ix(
     amount: u64,
     min_sol_output: u64,
@@ -326,7 +398,6 @@ fn sell_ix(
     let bonding_curve = derive_bonding_curve(mint);
     let assoc_bonding_curve = derive_ata(&bonding_curve, mint, token_program);
     let assoc_user = derive_ata(user, mint, token_program);
-    let bonding_curve_v2 = derive_bonding_curve_v2(mint);
 
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SELL_DISC);
@@ -334,25 +405,27 @@ fn sell_ix(
     data.extend_from_slice(&min_sol_output.to_le_bytes());
 
     let mut accounts = vec![
-        AccountMeta::new_readonly(*GLOBAL_PDA, false),           //  0
-        AccountMeta::new(*fee_recipient, false),                 //  1
-        AccountMeta::new_readonly(*mint, false),                 //  2
-        AccountMeta::new(bonding_curve, false),                  //  3
-        AccountMeta::new(assoc_bonding_curve, false),            //  4
-        AccountMeta::new(assoc_user, false),                     //  5
-        AccountMeta::new(*user, true),                           //  6
-        AccountMeta::new_readonly(system_program::id(), false),  //  7
-        AccountMeta::new(*creator_vault, false),                 //  8
-        AccountMeta::new_readonly(*token_program, false),        //  9
-        AccountMeta::new_readonly(*EVENT_AUTHORITY, false),      // 10
-        AccountMeta::new_readonly(*PUMP_PROGRAM_ID, false),      // 11
-        AccountMeta::new_readonly(*FEE_CONFIG_PDA, false),       // 12
-        AccountMeta::new_readonly(*FEE_PROGRAM_ID, false),       // 13
+        AccountMeta::new_readonly(*GLOBAL_PDA, false), //  0
+        AccountMeta::new(*fee_recipient, false),       //  1
+        AccountMeta::new_readonly(*mint, false),       //  2
+        AccountMeta::new(bonding_curve, false),        //  3
+        AccountMeta::new(assoc_bonding_curve, false),  //  4
+        AccountMeta::new(assoc_user, false),           //  5
+        AccountMeta::new(*user, true),                 //  6
+        AccountMeta::new_readonly(system_program::id(), false), //  7
+        AccountMeta::new(*creator_vault, false),       //  8
+        AccountMeta::new_readonly(*token_program, false), //  9
+        AccountMeta::new_readonly(*EVENT_AUTHORITY, false), // 10
+        AccountMeta::new_readonly(*PUMP_PROGRAM_ID, false), // 11
+        AccountMeta::new_readonly(*FEE_CONFIG_PDA, false), // 12
+        AccountMeta::new_readonly(*FEE_PROGRAM_ID, false), // 13
     ];
     if is_cashback {
-        accounts.push(AccountMeta::new(derive_user_volume_accumulator(user), false)); // 14
+        accounts.push(AccountMeta::new(
+            derive_user_volume_accumulator(user),
+            false,
+        )); // 14
     }
-    accounts.push(AccountMeta::new(bonding_curve_v2, false)); // 14 or 15
 
     Instruction::new_with_bytes(*PUMP_PROGRAM_ID, &data, accounts)
 }
@@ -406,9 +479,223 @@ pub struct SellParams {
     pub compute_unit_price_micro_lamports: Option<u64>,
 }
 
+pub struct BuyV2Params {
+    pub base_mint: Pubkey,
+    /// Defaults to WSOL if `None`.
+    pub quote_mint: Option<Pubkey>,
+    pub buy_mode: BuyV2Mode,
+    pub creator_vault: Pubkey,
+    pub base_token_program: Option<Pubkey>,
+    /// Defaults to SPL Token program if `None`.
+    pub quote_token_program: Option<Pubkey>,
+    pub fee_recipient: Pubkey,
+    pub buyback_fee_recipient: Pubkey,
+    pub recent_blockhash: Hash,
+    pub compute_unit_limit: Option<u32>,
+    pub compute_unit_price_micro_lamports: Option<u64>,
+}
+
+pub enum BuyV2Mode {
+    Buy {
+        token_amount: u64,
+        max_quote_cost: u64,
+    },
+    ExactQuoteIn {
+        spendable_quote_in: u64,
+        min_tokens_out: u64,
+    },
+}
+
+pub struct SellV2Params {
+    pub base_mint: Pubkey,
+    /// Defaults to WSOL if `None`.
+    pub quote_mint: Option<Pubkey>,
+    pub amount_tokens: u64,
+    pub min_quote_out: u64,
+    pub creator_vault: Pubkey,
+    pub base_token_program: Option<Pubkey>,
+    /// Defaults to SPL Token program if `None`.
+    pub quote_token_program: Option<Pubkey>,
+    pub fee_recipient: Pubkey,
+    pub buyback_fee_recipient: Pubkey,
+    pub recent_blockhash: Hash,
+    pub compute_unit_limit: Option<u32>,
+    pub compute_unit_price_micro_lamports: Option<u64>,
+}
+
 // =====================================================================
 // Transaction Builders  (pure, no RPC)
 // =====================================================================
+
+fn pump_v2_accounts(
+    user: &Pubkey,
+    base_mint: &Pubkey,
+    quote_mint: &Pubkey,
+    base_token_program: &Pubkey,
+    quote_token_program: &Pubkey,
+    creator_vault: &Pubkey,
+    fee_recipient: &Pubkey,
+    buyback_fee_recipient: &Pubkey,
+    include_global_volume_accumulator: bool,
+) -> Vec<AccountMeta> {
+    let bonding_curve = derive_bonding_curve(base_mint);
+    let associated_quote_fee_recipient = derive_ata(fee_recipient, quote_mint, quote_token_program);
+    let associated_quote_buyback_fee_recipient =
+        derive_ata(buyback_fee_recipient, quote_mint, quote_token_program);
+    let associated_base_bonding_curve = derive_ata(&bonding_curve, base_mint, base_token_program);
+    let associated_quote_bonding_curve =
+        derive_ata(&bonding_curve, quote_mint, quote_token_program);
+    let associated_base_user = derive_ata(user, base_mint, base_token_program);
+    let associated_quote_user = derive_ata(user, quote_mint, quote_token_program);
+    let associated_creator_vault = derive_ata(creator_vault, quote_mint, quote_token_program);
+    let user_volume_accumulator = derive_user_volume_accumulator(user);
+    let associated_user_volume_accumulator =
+        derive_ata(&user_volume_accumulator, quote_mint, quote_token_program);
+
+    let mut accounts = vec![
+        AccountMeta::new_readonly(*GLOBAL_PDA, false),
+        AccountMeta::new_readonly(*base_mint, false),
+        AccountMeta::new_readonly(*quote_mint, false),
+        AccountMeta::new_readonly(*base_token_program, false),
+        AccountMeta::new_readonly(*quote_token_program, false),
+        AccountMeta::new_readonly(*ATA_PROGRAM_ID, false),
+        AccountMeta::new(*fee_recipient, false),
+        AccountMeta::new(associated_quote_fee_recipient, false),
+        AccountMeta::new(*buyback_fee_recipient, false),
+        AccountMeta::new(associated_quote_buyback_fee_recipient, false),
+        AccountMeta::new(bonding_curve, false),
+        AccountMeta::new(associated_base_bonding_curve, false),
+        AccountMeta::new(associated_quote_bonding_curve, false),
+        AccountMeta::new(*user, true),
+        AccountMeta::new(associated_base_user, false),
+        AccountMeta::new(associated_quote_user, false),
+        AccountMeta::new(*creator_vault, false),
+        AccountMeta::new(associated_creator_vault, false),
+        AccountMeta::new_readonly(derive_sharing_config(base_mint), false),
+    ];
+
+    if include_global_volume_accumulator {
+        accounts.push(AccountMeta::new_readonly(*GLOBAL_VOLUME_ACCUMULATOR, false));
+    }
+    accounts.push(AccountMeta::new(user_volume_accumulator, false));
+    accounts.push(AccountMeta::new(associated_user_volume_accumulator, false));
+    accounts.push(AccountMeta::new_readonly(*FEE_CONFIG_PDA, false));
+    accounts.push(AccountMeta::new_readonly(*FEE_PROGRAM_ID, false));
+    accounts.push(AccountMeta::new_readonly(system_program::id(), false));
+    accounts.push(AccountMeta::new_readonly(*EVENT_AUTHORITY, false));
+    accounts.push(AccountMeta::new_readonly(*PUMP_PROGRAM_ID, false));
+    accounts
+}
+
+fn buy_v2_ix(
+    amount: u64,
+    max_quote_cost: u64,
+    user: &Pubkey,
+    params: &BuyV2Params,
+    quote_mint: &Pubkey,
+    base_token_program: &Pubkey,
+    quote_token_program: &Pubkey,
+) -> Instruction {
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&BUY_V2_DISC);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&max_quote_cost.to_le_bytes());
+
+    Instruction::new_with_bytes(
+        *PUMP_PROGRAM_ID,
+        &data,
+        pump_v2_accounts(
+            user,
+            &params.base_mint,
+            quote_mint,
+            base_token_program,
+            quote_token_program,
+            &params.creator_vault,
+            &params.fee_recipient,
+            &params.buyback_fee_recipient,
+            true,
+        ),
+    )
+}
+
+fn buy_exact_quote_in_v2_ix(
+    spendable_quote_in: u64,
+    min_tokens_out: u64,
+    user: &Pubkey,
+    params: &BuyV2Params,
+    quote_mint: &Pubkey,
+    base_token_program: &Pubkey,
+    quote_token_program: &Pubkey,
+) -> Instruction {
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&BUY_EXACT_QUOTE_IN_V2_DISC);
+    data.extend_from_slice(&spendable_quote_in.to_le_bytes());
+    data.extend_from_slice(&min_tokens_out.to_le_bytes());
+
+    Instruction::new_with_bytes(
+        *PUMP_PROGRAM_ID,
+        &data,
+        pump_v2_accounts(
+            user,
+            &params.base_mint,
+            quote_mint,
+            base_token_program,
+            quote_token_program,
+            &params.creator_vault,
+            &params.fee_recipient,
+            &params.buyback_fee_recipient,
+            true,
+        ),
+    )
+}
+
+fn sell_v2_ix(
+    amount: u64,
+    min_quote_out: u64,
+    user: &Pubkey,
+    params: &SellV2Params,
+    quote_mint: &Pubkey,
+    base_token_program: &Pubkey,
+    quote_token_program: &Pubkey,
+) -> Instruction {
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&SELL_V2_DISC);
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&min_quote_out.to_le_bytes());
+
+    Instruction::new_with_bytes(
+        *PUMP_PROGRAM_ID,
+        &data,
+        pump_v2_accounts(
+            user,
+            &params.base_mint,
+            quote_mint,
+            base_token_program,
+            quote_token_program,
+            &params.creator_vault,
+            &params.fee_recipient,
+            &params.buyback_fee_recipient,
+            false,
+        ),
+    )
+}
+
+fn maybe_create_quote_ata_ix(
+    user: &Pubkey,
+    quote_mint: &Pubkey,
+    quote_token_program: &Pubkey,
+) -> Option<Instruction> {
+    if quote_mint == &*WSOL_MINT {
+        None
+    } else {
+        Some(create_ata_idempotent_ix(
+            user,
+            user,
+            quote_mint,
+            quote_token_program,
+        ))
+    }
+}
 
 /// Construct a fully-signed buy transaction. No network calls.
 pub fn build_buy_transaction(
@@ -431,7 +718,10 @@ pub fn build_buy_transaction(
         &token_prog,
     ));
     match &params.buy_mode {
-        BuyMode::Buy { token_amount, max_sol_cost } => {
+        BuyMode::Buy {
+            token_amount,
+            max_sol_cost,
+        } => {
             ixs.push(buy_ix(
                 *token_amount,
                 *max_sol_cost,
@@ -442,7 +732,11 @@ pub fn build_buy_transaction(
                 &params.fee_recipient,
             ));
         }
-        BuyMode::ExactSolIn { amount_sol_lamports, min_tokens_out, track_volume } => {
+        BuyMode::ExactSolIn {
+            amount_sol_lamports,
+            min_tokens_out,
+            track_volume,
+        } => {
             ixs.push(buy_exact_sol_in_ix(
                 *amount_sol_lamports,
                 *min_tokens_out,
@@ -497,6 +791,113 @@ pub fn build_sell_transaction(
     ))
 }
 
+/// Construct a fully-signed buy_v2 / buy_exact_quote_in_v2 transaction.
+pub fn build_buy_v2_transaction(
+    signer: &Keypair,
+    params: &BuyV2Params,
+) -> Result<Transaction, PumpError> {
+    let user = signer.pubkey();
+    let quote_mint = params.quote_mint.unwrap_or(*WSOL_MINT);
+    let base_token_prog = params.base_token_program.unwrap_or(*TOKEN_PROGRAM_ID);
+    let quote_token_prog = params.quote_token_program.unwrap_or(*TOKEN_PROGRAM_ID);
+    let cu_limit = params.compute_unit_limit.unwrap_or(300_000);
+
+    let mut ixs = Vec::with_capacity(5);
+    ixs.push(compute_unit_limit_ix(cu_limit));
+    if let Some(price) = params.compute_unit_price_micro_lamports {
+        ixs.push(compute_unit_price_ix(price));
+    }
+    ixs.push(create_ata_idempotent_ix(
+        &user,
+        &user,
+        &params.base_mint,
+        &base_token_prog,
+    ));
+    if let Some(ix) = maybe_create_quote_ata_ix(&user, &quote_mint, &quote_token_prog) {
+        ixs.push(ix);
+    }
+    match &params.buy_mode {
+        BuyV2Mode::Buy {
+            token_amount,
+            max_quote_cost,
+        } => {
+            ixs.push(buy_v2_ix(
+                *token_amount,
+                *max_quote_cost,
+                &user,
+                params,
+                &quote_mint,
+                &base_token_prog,
+                &quote_token_prog,
+            ));
+        }
+        BuyV2Mode::ExactQuoteIn {
+            spendable_quote_in,
+            min_tokens_out,
+        } => {
+            ixs.push(buy_exact_quote_in_v2_ix(
+                *spendable_quote_in,
+                *min_tokens_out,
+                &user,
+                params,
+                &quote_mint,
+                &base_token_prog,
+                &quote_token_prog,
+            ));
+        }
+    }
+
+    Ok(Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&user),
+        &[signer],
+        params.recent_blockhash,
+    ))
+}
+
+/// Construct a fully-signed sell_v2 transaction.
+pub fn build_sell_v2_transaction(
+    signer: &Keypair,
+    params: &SellV2Params,
+) -> Result<Transaction, PumpError> {
+    let user = signer.pubkey();
+    let quote_mint = params.quote_mint.unwrap_or(*WSOL_MINT);
+    let base_token_prog = params.base_token_program.unwrap_or(*TOKEN_PROGRAM_ID);
+    let quote_token_prog = params.quote_token_program.unwrap_or(*TOKEN_PROGRAM_ID);
+    let cu_limit = params.compute_unit_limit.unwrap_or(300_000);
+
+    let mut ixs = Vec::with_capacity(5);
+    ixs.push(compute_unit_limit_ix(cu_limit));
+    if let Some(price) = params.compute_unit_price_micro_lamports {
+        ixs.push(compute_unit_price_ix(price));
+    }
+    ixs.push(create_ata_idempotent_ix(
+        &user,
+        &user,
+        &params.base_mint,
+        &base_token_prog,
+    ));
+    if let Some(ix) = maybe_create_quote_ata_ix(&user, &quote_mint, &quote_token_prog) {
+        ixs.push(ix);
+    }
+    ixs.push(sell_v2_ix(
+        params.amount_tokens,
+        params.min_quote_out,
+        &user,
+        params,
+        &quote_mint,
+        &base_token_prog,
+        &quote_token_prog,
+    ));
+
+    Ok(Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&user),
+        &[signer],
+        params.recent_blockhash,
+    ))
+}
+
 // =====================================================================
 // Send helper
 // =====================================================================
@@ -540,4 +941,136 @@ pub fn quick_sell(
 ) -> Result<Signature, PumpError> {
     let tx = build_sell_transaction(signer, params)?;
     send_transaction(rpc_client, &tx)
+}
+
+pub fn quick_buy_v2(
+    rpc_client: &RpcClient,
+    signer: &Keypair,
+    params: &BuyV2Params,
+) -> Result<Signature, PumpError> {
+    let tx = build_buy_v2_transaction(signer, params)?;
+    send_transaction(rpc_client, &tx)
+}
+
+pub fn quick_sell_v2(
+    rpc_client: &RpcClient,
+    signer: &Keypair,
+    params: &SellV2Params,
+) -> Result<Signature, PumpError> {
+    let tx = build_sell_v2_transaction(signer, params)?;
+    send_transaction(rpc_client, &tx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buy_v2_params(mode: BuyV2Mode) -> BuyV2Params {
+        BuyV2Params {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Some(*WSOL_MINT),
+            buy_mode: mode,
+            creator_vault: Pubkey::new_unique(),
+            base_token_program: Some(*TOKEN_2022_PROGRAM_ID),
+            quote_token_program: Some(*TOKEN_PROGRAM_ID),
+            fee_recipient: Pubkey::new_unique(),
+            buyback_fee_recipient: BUYBACK_FEE_RECIPIENTS[0],
+            recent_blockhash: Hash::new_unique(),
+            compute_unit_limit: None,
+            compute_unit_price_micro_lamports: None,
+        }
+    }
+
+    fn sell_v2_params() -> SellV2Params {
+        SellV2Params {
+            base_mint: Pubkey::new_unique(),
+            quote_mint: Some(*WSOL_MINT),
+            amount_tokens: 1_000,
+            min_quote_out: 1,
+            creator_vault: Pubkey::new_unique(),
+            base_token_program: Some(*TOKEN_2022_PROGRAM_ID),
+            quote_token_program: Some(*TOKEN_PROGRAM_ID),
+            fee_recipient: Pubkey::new_unique(),
+            buyback_fee_recipient: BUYBACK_FEE_RECIPIENTS[0],
+            recent_blockhash: Hash::new_unique(),
+            compute_unit_limit: None,
+            compute_unit_price_micro_lamports: None,
+        }
+    }
+
+    #[test]
+    fn buy_v2_uses_unified_account_layout() {
+        let user = Pubkey::new_unique();
+        let params = buy_v2_params(BuyV2Mode::Buy {
+            token_amount: 1_000,
+            max_quote_cost: 2_000,
+        });
+        let ix = buy_v2_ix(
+            1_000,
+            2_000,
+            &user,
+            &params,
+            &WSOL_MINT,
+            &TOKEN_2022_PROGRAM_ID,
+            &TOKEN_PROGRAM_ID,
+        );
+        assert_eq!(ix.data.len(), 24);
+        assert_eq!(ix.accounts.len(), 27);
+    }
+
+    #[test]
+    fn buy_exact_quote_in_v2_uses_unified_account_layout() {
+        let user = Pubkey::new_unique();
+        let params = buy_v2_params(BuyV2Mode::ExactQuoteIn {
+            spendable_quote_in: 2_000,
+            min_tokens_out: 1,
+        });
+        let ix = buy_exact_quote_in_v2_ix(
+            2_000,
+            1,
+            &user,
+            &params,
+            &WSOL_MINT,
+            &TOKEN_2022_PROGRAM_ID,
+            &TOKEN_PROGRAM_ID,
+        );
+        assert_eq!(ix.data.len(), 24);
+        assert_eq!(ix.accounts.len(), 27);
+    }
+
+    #[test]
+    fn sell_v2_uses_unified_account_layout() {
+        let user = Pubkey::new_unique();
+        let params = sell_v2_params();
+        let ix = sell_v2_ix(
+            1_000,
+            1,
+            &user,
+            &params,
+            &WSOL_MINT,
+            &TOKEN_2022_PROGRAM_ID,
+            &TOKEN_PROGRAM_ID,
+        );
+        assert_eq!(ix.data.len(), 24);
+        assert_eq!(ix.accounts.len(), 26);
+    }
+
+    #[test]
+    fn legacy_cashback_sell_has_single_remaining_account() {
+        let user = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let creator_vault = Pubkey::new_unique();
+        let fee_recipient = Pubkey::new_unique();
+        let ix = sell_ix(
+            1_000,
+            1,
+            &user,
+            &mint,
+            &creator_vault,
+            &TOKEN_PROGRAM_ID,
+            &fee_recipient,
+            true,
+        );
+        assert_eq!(ix.accounts.len(), 15);
+    }
 }
