@@ -89,7 +89,6 @@ pub static AMM_FEE_CONFIG: LazyLock<Pubkey> = LazyLock::new(|| {
 // Instruction Discriminators
 // =====================================================================
 
-const AMM_BUY_DISC: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 const AMM_BUY_EXACT_QUOTE_IN_DISC: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
 const AMM_SELL_DISC: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
 
@@ -119,8 +118,8 @@ pub fn amm_user_volume_accumulator(user: &Pubkey) -> Pubkey {
 }
 
 /// Derive pool-v2 PDA (required trailing account after PumpSwap upgrade).
-pub fn amm_pool_v2(base_mint: &Pubkey) -> Pubkey {
-    Pubkey::find_program_address(&[b"pool-v2", base_mint.as_ref()], &AMM_PROGRAM_ID).0
+pub fn amm_pool_v2(mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"pool-v2", mint.as_ref()], &AMM_PROGRAM_ID).0
 }
 
 pub fn amm_coin_creator_vault_authority(coin_creator: &Pubkey) -> Pubkey {
@@ -378,83 +377,35 @@ fn append_v2_remaining_accounts(
         }
     }
 
-    accounts.push(AccountMeta::new_readonly(
-        amm_pool_v2(&ctx.base_mint),
-        false,
-    ));
+    let pool_v2_mint = if ctx.is_reversed {
+        ctx.quote_mint
+    } else {
+        ctx.base_mint
+    };
+    let pool_v2 = AccountMeta::new_readonly(amm_pool_v2(&pool_v2_mint), false);
 
     let buyback_fee_ata = derive_ata(
         &ctx.buyback_fee_recipient,
         &ctx.quote_mint,
         &ctx.quote_token_program,
     );
-    accounts.push(AccountMeta::new_readonly(ctx.buyback_fee_recipient, false));
-    accounts.push(AccountMeta::new(buyback_fee_ata, false));
+    let buyback_fee_recipient = AccountMeta::new_readonly(ctx.buyback_fee_recipient, false);
+    let buyback_fee_ata = AccountMeta::new(buyback_fee_ata, false);
+
+    if ctx.is_reversed {
+        accounts.push(buyback_fee_recipient);
+        accounts.push(buyback_fee_ata);
+        accounts.push(pool_v2);
+    } else {
+        accounts.push(pool_v2);
+        accounts.push(buyback_fee_recipient);
+        accounts.push(buyback_fee_ata);
+    }
 }
 
 // =====================================================================
 // PumpAMM swap instructions
 // =====================================================================
-
-/// Buy — buy `base_amount_out` tokens, paying at most `max_quote_in` SOL.
-/// Uses the `Buy` instruction (not `BuyExactQuoteIn`), matching all major SDKs.
-/// 23 accounts (Anchor resolves coinCreatorVault*, volume accumulators, feeConfig, feeProgram from IDL).
-fn amm_buy_ix(
-    base_amount_out: u64,
-    max_quote_in: u64,
-    ctx: &AmmSwapContext,
-    user: &Pubkey,
-) -> Instruction {
-    let user_base_ata = derive_ata(user, &ctx.base_mint, &ctx.base_token_program);
-    let user_quote_ata = derive_ata(user, &ctx.quote_mint, &ctx.quote_token_program);
-    let protocol_fee_ata = derive_ata(
-        &ctx.protocol_fee_recipient,
-        &ctx.quote_mint,
-        &ctx.quote_token_program,
-    );
-    let creator_vault_auth = amm_coin_creator_vault_authority(&ctx.coin_creator);
-    let creator_vault_ata = derive_ata(
-        &creator_vault_auth,
-        &ctx.quote_mint,
-        &ctx.quote_token_program,
-    );
-    let user_vol = amm_user_volume_accumulator(user);
-
-    let mut data = Vec::with_capacity(25);
-    data.extend_from_slice(&AMM_BUY_DISC);
-    data.extend_from_slice(&base_amount_out.to_le_bytes());
-    data.extend_from_slice(&max_quote_in.to_le_bytes());
-    data.push(0u8);
-
-    let mut accounts = vec![
-        AccountMeta::new(ctx.pool, false),
-        AccountMeta::new(*user, true),
-        AccountMeta::new_readonly(*AMM_GLOBAL_CONFIG, false),
-        AccountMeta::new_readonly(ctx.base_mint, false),
-        AccountMeta::new_readonly(ctx.quote_mint, false),
-        AccountMeta::new(user_base_ata, false),
-        AccountMeta::new(user_quote_ata, false),
-        AccountMeta::new(ctx.pool_base_token_account, false),
-        AccountMeta::new(ctx.pool_quote_token_account, false),
-        AccountMeta::new_readonly(ctx.protocol_fee_recipient, false),
-        AccountMeta::new(protocol_fee_ata, false),
-        AccountMeta::new_readonly(ctx.base_token_program, false),
-        AccountMeta::new_readonly(ctx.quote_token_program, false),
-        AccountMeta::new_readonly(system_program::id(), false),
-        AccountMeta::new_readonly(*ATA_PROGRAM_ID, false),
-        AccountMeta::new_readonly(*AMM_EVENT_AUTHORITY, false),
-        AccountMeta::new_readonly(*AMM_PROGRAM_ID, false),
-        AccountMeta::new(creator_vault_ata, false),
-        AccountMeta::new_readonly(creator_vault_auth, false),
-        AccountMeta::new_readonly(*AMM_GLOBAL_VOLUME_ACCUM, false),
-        AccountMeta::new(user_vol, false),
-        AccountMeta::new_readonly(*AMM_FEE_CONFIG, false),
-        AccountMeta::new_readonly(*AMM_FEE_PROGRAM_ID, false),
-    ];
-    append_v2_remaining_accounts(&mut accounts, ctx, user, false);
-
-    Instruction::new_with_bytes(*AMM_PROGRAM_ID, &data, accounts)
-}
 
 /// BuyExactQuoteIn — spend exact SOL (quote), receive >= min tokens (base).
 /// Same 23+1 account layout as Buy, different discriminator and params.
@@ -649,30 +600,7 @@ fn build_reversed_buy(
     params: &AmmBuyParams,
 ) -> Transaction {
     let user = signer.pubkey();
-    // On-chain: base=WSOL, quote=Token → swap back for Sell instruction
-    let on_chain_ctx = AmmSwapContext {
-        pool: ctx.pool,
-        base_mint: ctx.quote_mint, // WSOL
-        quote_mint: ctx.base_mint, // Token
-        base_token_program: ctx.quote_token_program,
-        quote_token_program: ctx.base_token_program,
-        pool_base_token_account: ctx.pool_quote_token_account,
-        pool_quote_token_account: ctx.pool_base_token_account,
-        coin_creator: ctx.coin_creator,
-        protocol_fee_recipient: ctx.protocol_fee_recipient,
-        buyback_fee_recipient: ctx.buyback_fee_recipient,
-        base_reserve: ctx.quote_reserve,
-        quote_reserve: ctx.base_reserve,
-        is_reversed: false,
-        is_mayhem_mode: ctx.is_mayhem_mode,
-        is_cashback_coin: ctx.is_cashback_coin,
-    };
-
-    let user_wsol_ata = derive_ata(
-        &user,
-        &on_chain_ctx.base_mint,
-        &on_chain_ctx.base_token_program,
-    );
+    let user_wsol_ata = derive_ata(&user, &ctx.base_mint, &ctx.base_token_program);
     let cu = params.compute_unit_limit.unwrap_or(300_000);
 
     let mut ixs = Vec::with_capacity(8);
@@ -683,37 +611,28 @@ fn build_reversed_buy(
     ixs.push(create_ata_idempotent_ix(
         &user,
         &user,
-        &on_chain_ctx.quote_mint,
-        &on_chain_ctx.quote_token_program,
+        &ctx.quote_mint,
+        &ctx.quote_token_program,
     ));
     ixs.push(create_ata_idempotent_ix(
         &user,
         &user,
-        &on_chain_ctx.base_mint,
-        &on_chain_ctx.base_token_program,
+        &ctx.base_mint,
+        &ctx.base_token_program,
     ));
-    let max_quote_in = params
-        .sol_amount_lamports
-        .checked_mul(10_000 + params.slippage_bps)
-        .unwrap_or(params.sol_amount_lamports)
-        / 10_000;
-    ixs.push(system_transfer_ix(&user, &user_wsol_ata, max_quote_in));
-    ixs.push(sync_native_ix(
-        &user_wsol_ata,
-        &on_chain_ctx.base_token_program,
-    ));
-    // Sell WSOL to get Token (min_tokens_out = 1 for simplicity in reversed)
-    ixs.push(amm_sell_ix(
-        params.sol_amount_lamports,
-        1,
-        &on_chain_ctx,
+    ixs.push(system_transfer_ix(
         &user,
+        &user_wsol_ata,
+        params.sol_amount_lamports,
     ));
+    ixs.push(sync_native_ix(&user_wsol_ata, &ctx.base_token_program));
+    // Sell WSOL to get Token (min_tokens_out = 1 for simplicity in reversed)
+    ixs.push(amm_sell_ix(params.sol_amount_lamports, 1, ctx, &user));
     ixs.push(close_account_ix(
         &user_wsol_ata,
         &user,
         &user,
-        &on_chain_ctx.base_token_program,
+        &ctx.base_token_program,
     ));
 
     Transaction::new_signed_with_payer(&ixs, Some(&user), &[signer], params.recent_blockhash)
@@ -764,29 +683,7 @@ fn build_reversed_sell(
     params: &AmmSellParams,
 ) -> Transaction {
     let user = signer.pubkey();
-    let on_chain_ctx = AmmSwapContext {
-        pool: ctx.pool,
-        base_mint: ctx.quote_mint,
-        quote_mint: ctx.base_mint,
-        base_token_program: ctx.quote_token_program,
-        quote_token_program: ctx.base_token_program,
-        pool_base_token_account: ctx.pool_quote_token_account,
-        pool_quote_token_account: ctx.pool_base_token_account,
-        coin_creator: ctx.coin_creator,
-        protocol_fee_recipient: ctx.protocol_fee_recipient,
-        buyback_fee_recipient: ctx.buyback_fee_recipient,
-        base_reserve: ctx.quote_reserve,
-        quote_reserve: ctx.base_reserve,
-        is_reversed: false,
-        is_mayhem_mode: ctx.is_mayhem_mode,
-        is_cashback_coin: ctx.is_cashback_coin,
-    };
-
-    let user_wsol_ata = derive_ata(
-        &user,
-        &on_chain_ctx.base_mint,
-        &on_chain_ctx.base_token_program,
-    );
+    let user_wsol_ata = derive_ata(&user, &ctx.base_mint, &ctx.base_token_program);
     let cu = params.compute_unit_limit.unwrap_or(300_000);
 
     let mut ixs = Vec::with_capacity(5);
@@ -797,29 +694,20 @@ fn build_reversed_sell(
     ixs.push(create_ata_idempotent_ix(
         &user,
         &user,
-        &on_chain_ctx.base_mint,
-        &on_chain_ctx.base_token_program,
+        &ctx.base_mint,
+        &ctx.base_token_program,
     ));
-    // Buy WSOL (base) with Token (quote): calculate WSOL amount from token input
-    let total_fee_bps = 100u128;
-    let effective = (params.token_amount as u128) * 10_000 / (10_000 + total_fee_bps);
-    let denom = (on_chain_ctx.quote_reserve as u128) + effective;
-    let wsol_out = if denom > 0 {
-        ((on_chain_ctx.base_reserve as u128) * effective / denom) as u64
-    } else {
-        params.min_sol_out
-    };
-    ixs.push(amm_buy_ix(
-        wsol_out,
+    ixs.push(amm_buy_exact_quote_in_ix(
         params.token_amount,
-        &on_chain_ctx,
+        params.min_sol_out,
+        ctx,
         &user,
     ));
     ixs.push(close_account_ix(
         &user_wsol_ata,
         &user,
         &user,
-        &on_chain_ctx.base_token_program,
+        &ctx.base_token_program,
     ));
 
     Transaction::new_signed_with_payer(&ixs, Some(&user), &[signer], params.recent_blockhash)
@@ -894,24 +782,34 @@ pub fn quick_amm_sell(
 
 /// Calculate expected token output for a given SOL input (buy).
 pub fn amm_quote_buy(ctx: &AmmSwapContext, sol_amount_in: u64, total_fee_bps: u64) -> u64 {
+    let (reserve_in, reserve_out) = if ctx.is_reversed {
+        (ctx.base_reserve, ctx.quote_reserve)
+    } else {
+        (ctx.quote_reserve, ctx.base_reserve)
+    };
     let fee_mult = 10_000u128.saturating_sub(total_fee_bps as u128);
     let amount_after_fee = (sol_amount_in as u128) * fee_mult / 10_000;
-    let denom = (ctx.quote_reserve as u128) + amount_after_fee;
+    let denom = (reserve_in as u128) + amount_after_fee;
     if denom == 0 {
         return 0;
     }
-    ((ctx.base_reserve as u128) * amount_after_fee / denom) as u64
+    ((reserve_out as u128) * amount_after_fee / denom) as u64
 }
 
 /// Calculate expected SOL output for a given token input (sell).
 pub fn amm_quote_sell(ctx: &AmmSwapContext, token_amount_in: u64, total_fee_bps: u64) -> u64 {
+    let (reserve_in, reserve_out) = if ctx.is_reversed {
+        (ctx.quote_reserve, ctx.base_reserve)
+    } else {
+        (ctx.base_reserve, ctx.quote_reserve)
+    };
     let fee_mult = 10_000u128.saturating_sub(total_fee_bps as u128);
     let amount_after_fee = (token_amount_in as u128) * fee_mult / 10_000;
-    let denom = (ctx.base_reserve as u128) + amount_after_fee;
+    let denom = (reserve_in as u128) + amount_after_fee;
     if denom == 0 {
         return 0;
     }
-    ((ctx.quote_reserve as u128) * amount_after_fee / denom) as u64
+    ((reserve_out as u128) * amount_after_fee / denom) as u64
 }
 
 #[cfg(test)]
@@ -919,10 +817,19 @@ mod tests {
     use super::*;
 
     fn test_context(is_cashback_coin: bool) -> AmmSwapContext {
+        test_context_for(false, is_cashback_coin)
+    }
+
+    fn reversed_context(is_cashback_coin: bool) -> AmmSwapContext {
+        test_context_for(true, is_cashback_coin)
+    }
+
+    fn test_context_for(is_reversed: bool, is_cashback_coin: bool) -> AmmSwapContext {
+        let token_mint = Pubkey::new_unique();
         AmmSwapContext {
             pool: Pubkey::new_unique(),
-            base_mint: Pubkey::new_unique(),
-            quote_mint: *WSOL_MINT,
+            base_mint: if is_reversed { *WSOL_MINT } else { token_mint },
+            quote_mint: if is_reversed { token_mint } else { *WSOL_MINT },
             base_token_program: *TOKEN_2022_ID,
             quote_token_program: *TOKEN_PROGRAM_ID,
             pool_base_token_account: Pubkey::new_unique(),
@@ -930,9 +837,9 @@ mod tests {
             coin_creator: Pubkey::new_unique(),
             protocol_fee_recipient: Pubkey::new_unique(),
             buyback_fee_recipient: AMM_BUYBACK_FEE_RECIPIENTS[0],
-            base_reserve: 1_000_000,
-            quote_reserve: 1_000_000,
-            is_reversed: false,
+            base_reserve: if is_reversed { 1_000_000 } else { 2_000_000 },
+            quote_reserve: if is_reversed { 2_000_000 } else { 1_000_000 },
+            is_reversed,
             is_mayhem_mode: false,
             is_cashback_coin,
         }
@@ -975,5 +882,100 @@ mod tests {
 
         let ix = amm_sell_ix(1_000, 1, &test_context(true), &user);
         assert_eq!(ix.accounts.len(), 26);
+    }
+
+    #[test]
+    fn reversed_v2_tail_matches_successful_on_chain_layout() {
+        let user = Pubkey::new_unique();
+        let ctx = reversed_context(false);
+        let ix = amm_sell_ix(1_000, 1, &ctx, &user);
+        let tail = &ix.accounts[ix.accounts.len() - 3..];
+
+        assert_eq!(tail[0].pubkey, ctx.buyback_fee_recipient);
+        assert!(!tail[0].is_writable);
+        assert_eq!(
+            tail[1].pubkey,
+            derive_ata(
+                &ctx.buyback_fee_recipient,
+                &ctx.quote_mint,
+                &ctx.quote_token_program
+            )
+        );
+        assert!(tail[1].is_writable);
+        assert_eq!(tail[2].pubkey, amm_pool_v2(&ctx.quote_mint));
+        assert!(!tail[2].is_writable);
+    }
+
+    #[test]
+    fn reversed_buy_and_sell_use_raw_on_chain_accounts() {
+        let signer = Keypair::new();
+        let user = signer.pubkey();
+        let ctx = reversed_context(false);
+        let buy_params = AmmBuyParams {
+            sol_amount_lamports: 1_000_000,
+            slippage_bps: 100,
+            recent_blockhash: Hash::new_unique(),
+            compute_unit_limit: None,
+            compute_unit_price_micro_lamports: None,
+        };
+        let buy_tx = build_amm_buy_transaction(&signer, &ctx, &buy_params);
+        let buy_ix = buy_tx
+            .message
+            .instructions
+            .iter()
+            .find(|ix| buy_tx.message.account_keys[ix.program_id_index as usize] == *AMM_PROGRAM_ID)
+            .unwrap();
+        let buy_accounts: Vec<Pubkey> = buy_ix
+            .accounts
+            .iter()
+            .map(|idx| buy_tx.message.account_keys[*idx as usize])
+            .collect();
+
+        assert_eq!(&buy_ix.data[..8], &AMM_SELL_DISC);
+        assert_eq!(buy_accounts[1], user);
+        assert_eq!(buy_accounts[3], *WSOL_MINT);
+        assert_eq!(buy_accounts[4], ctx.quote_mint);
+
+        let sell_params = AmmSellParams {
+            token_amount: 1_000_000,
+            min_sol_out: 1,
+            recent_blockhash: Hash::new_unique(),
+            compute_unit_limit: None,
+            compute_unit_price_micro_lamports: None,
+        };
+        let sell_tx = build_amm_sell_transaction(&signer, &ctx, &sell_params);
+        let sell_ix = sell_tx
+            .message
+            .instructions
+            .iter()
+            .find(|ix| {
+                sell_tx.message.account_keys[ix.program_id_index as usize] == *AMM_PROGRAM_ID
+            })
+            .unwrap();
+        let sell_accounts: Vec<Pubkey> = sell_ix
+            .accounts
+            .iter()
+            .map(|idx| sell_tx.message.account_keys[*idx as usize])
+            .collect();
+
+        assert_eq!(&sell_ix.data[..8], &AMM_BUY_EXACT_QUOTE_IN_DISC);
+        assert_eq!(sell_accounts[1], user);
+        assert_eq!(sell_accounts[3], *WSOL_MINT);
+        assert_eq!(sell_accounts[4], ctx.quote_mint);
+    }
+
+    #[test]
+    fn quotes_are_direction_aware_for_reversed_pools() {
+        let normal = test_context(false);
+        let reversed = reversed_context(false);
+
+        assert_eq!(
+            amm_quote_buy(&normal, 10_000, 0),
+            amm_quote_buy(&reversed, 10_000, 0)
+        );
+        assert_eq!(
+            amm_quote_sell(&normal, 10_000, 0),
+            amm_quote_sell(&reversed, 10_000, 0)
+        );
     }
 }
